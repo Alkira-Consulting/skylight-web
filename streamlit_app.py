@@ -142,16 +142,16 @@ def relative_time_query_builder(
             (datetime.now(pytz.timezone("utc")) - first_timestamp).total_seconds() / 60
         )
 
-        filters_list = filters + [
-            {
-                "range": {
-                    "@timestamp": {
-                        "gte": f"now-{offset_minutes}m",
-                        "time_zone": "Australia/Adelaide",
-                    }
+    filters_list = filters + [
+        {
+            "range": {
+                "@timestamp": {
+                    "gte": f"now-{offset_minutes}m",
+                    "time_zone": "Australia/Adelaide",
                 }
             }
-        ]
+        }
+    ]
         
     # Add reporting_group filter only if a value is provided
     if reporting_group:
