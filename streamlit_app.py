@@ -1,313 +1,332 @@
-import streamlit as st
-from streamlit.connections import ExperimentalBaseConnection
-from elasticsearch import Elasticsearch
-import pandas as pd
-from pandas import DataFrame, json_normalize
-from datetime import datetime, time, timedelta
 import pytz
 import time
+import requests
+import pandas as pd
+import streamlit as st
+from elasticsearch import Elasticsearch
+from datetime import datetime
+from elasticsearch.exceptions import AuthenticationException
+from streamlit.connections import ExperimentalBaseConnection
 
 
-class ElasticConnection(ExperimentalBaseConnection[Elasticsearch], Elasticsearch):
+# === Constants ===
+ELASTIC_CLOUD_ID = st.secrets["ELASTICSEARCH_CLOUD_ID"]
+ELASTIC_AUTH_REALM = st.secrets["ELASTIC_AUTH_REALM"]
+ELASTIC_API_KEY = st.secrets["ELASTIC_API_KEY"]
+ELASTIC_AUTH_BASE_URL = st.secrets["ELASTIC_AUTH_BASE_URL"]
+LOGOUT_URL = st.secrets["LOGOUT_URL"]
+AUTH_NONCE = st.secrets["AUTH_NONCE"]
+TIME_ZONE = st.secrets["TIME_ZONE"]
+
+
+# === Elasticsearch Connection Wrapper ===
+class ElasticConnection(ExperimentalBaseConnection[Elasticsearch]):
     def _connect(self, **kwargs) -> Elasticsearch:
-        if "cloud_id" in kwargs and "api_key" in kwargs:
-            cloud_id = kwargs.pop("cloud_id")
-            api_key = kwargs.pop("api_key")
-        else:
-            cloud_id = st.secrets["ELASTICSEARCH_CLOUD_ID"]
-            api_key = st.secrets["ELASTICSEARCH_API_KEY"]
-
-        return Elasticsearch(cloud_id=cloud_id, api_key=api_key)
+        bearer_auth = kwargs.pop("bearer_auth", "")
+        return Elasticsearch(
+            cloud_id=st.secrets["ELASTICSEARCH_CLOUD_ID"],
+            headers={
+                "Authorization": f"Bearer {bearer_auth}",
+                "Content-Type": "application/vnd.elasticsearch+json;compatible-with=8",
+                "Accept": "application/vnd.elasticsearch+json;compatible-with=8",
+            },
+        )
 
     @property
     def client(self) -> Elasticsearch:
         return self._instance
 
-    def search(
-        self,
-        index: str,
-        query: dict[str, any] = {},
-        sort: dict[str, any] = None,
-        source: list[str] = None,
-        size: int = None,
-        aggs: dict[str, any] = None,
-    ) -> DataFrame:
-        search = self.client.search(
-            index=index, query=query, sort=sort, source=source, size=size, aggs=aggs
-        )
+    def query(self, query, filter):
+        try:
+            # Run the query
+            res = self.client.sql.query(
+                query=query,
+                filter=filter,
+            )
 
-        return json_normalize([x["_source"] for x in search["hits"]["hits"]])
+            # Extract column names and rows
+            columns = [col["name"] for col in res["columns"]]
+            rows = res["rows"]
 
-    def searchv2(
-        self,
-        index: str,
-        query: dict[str, any] = {},
-        sort: dict[str, any] = None,
-        source: list[str] = None,
-        size: int = None,
-        aggs: dict[str, any] = None,
-    ) -> DataFrame:
-        return self.client.search(
-            index=index, query=query, sort=sort, source=source, size=size, aggs=aggs
-        )
+            # Convert to DataFrame
+            return pd.DataFrame(rows, columns=columns)
 
-    def search_aggregation(
-        self,
-        index: str,
-        aggregations: dict[str, any],
-        query: dict[str, any] = None,
-    ) -> DataFrame:
-        search = self.client.search(
-            index=index, aggregations=aggregations, query=query, size=0
-        )
-
-        aggs = []
-
-        for aggregation in aggregations:
-            if "buckets" in search["aggregations"][aggregation]:
-                buckets = search["aggregations"][aggregation]["buckets"]
-
-                df = pd.DataFrame(
-                    [
-                        {
-                            "bucket": bucket["key_as_string"],
-                            "value": bucket["total_ex_sum"]["value"],
-                        }
-                        for bucket in buckets
-                    ]
-                )
-
-                return df
-
-            else:
-                aggs.append(
-                    {
-                        "aggregation": aggregation,
-                        "value": search["aggregations"][aggregation]["value"],
-                    }
-                )
-
-        return pd.DataFrame(aggs)
+        except AuthenticationException as e:
+            print("Authentication failed:", e)
+        except Exception as e:
+            print("Search error:", e)
+        return None
 
 
-conn = st.connection("ao_elastic", type=ElasticConnection)
-adelaide_tz = pytz.timezone("Australia/Adelaide")
-time_filters = [
-    {"name": "15 min", "minute_offset": 15},
-    {"name": "30 min", "minute_offset": 30},
-    {"name": "1 hr", "minute_offset": 60},
-    {"name": "2 hr", "minute_offset": 120},
-    {"name": "3 hr", "minute_offset": 180},
-]
+# === OIDC Auth ===
+def login():
+    url = f"{ELASTIC_AUTH_BASE_URL}/prepare"
+    payload = {"realm": ELASTIC_AUTH_REALM, "nonce": AUTH_NONCE}
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": ELASTIC_API_KEY,
+    }
+
+    response = requests.post(url, headers=headers, json=payload)
+    return response.json()
+
+
+def logout(token: str, refresh_token: str):
+    url = f"{ELASTIC_AUTH_BASE_URL}/logout"
+    payload = {"token": token, "refresh_token": refresh_token}
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": ELASTIC_API_KEY,
+    }
+
+    response = requests.post(url, headers=headers, json=payload)
+    return response.json()
+
+
+def authorize(redirect_uri: str, state: str):
+    url = f"{ELASTIC_AUTH_BASE_URL}/authenticate"
+    payload = {
+        "redirect_uri": redirect_uri,
+        "state": state,
+        "nonce": AUTH_NONCE,
+        "realm": ELASTIC_AUTH_REALM,
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": ELASTIC_API_KEY,
+    }
+
+    response = requests.post(url, headers=headers, json=payload)
+    return response.json()
+
+
+def configure_filters(date=None, reporting_group=None):
+    filters = []
+
+    if not date:
+        date = "today/d"
+
+    filters.append(
+        {
+            "range": {
+                "@timestamp": {
+                    "gte": date,
+                    "lte": date,
+                    "time_zone": TIME_ZONE,
+                }
+            }
+        }
+    )
+
+    if reporting_group:
+        filters.append({"term": {"reporting.reporting_group": reporting_group}})
+
+    return {"bool": {"must": filters}}
+
 
 # Set the title and favicon that appear in the Browser's tab bar.
 st.set_page_config(
     page_title="Retail Analytics | Skylight",
 )
 
+if not st.session_state.get("access_token") and not st.query_params.get("login"):
+    login_response = login()
 
-# -----------------------------------------------------------------------------
-# Declare some useful functions.
-def relative_time_query_builder(
-    index: str, offset_minutes: int = None, reporting_group: str = None, filters: list[dict[str, any]] = []
-):
-    if offset_minutes is None:
-        time_query = {
-            "bool": {
-                "filter": filters
-                + [
-                    {
-                        "range": {
-                            "@timestamp": {
-                                "gte": "now/d",
-                                "time_zone": "Australia/Adelaide",
-                            }
-                        }
-                    },
-                ],
-            }
-        }
-
-        timestamp_search = conn.search(
-            index=index,
-            query=time_query,
-            sort=[{"@timestamp": "asc"}],
-            size=1,
-            source=["@timestamp"],
+    if login_response.get("redirect") and login_response.get("nonce"):
+        st.markdown(
+            f'<meta http-equiv="refresh" content="0;url={login_response["redirect"]}">',
+            unsafe_allow_html=True,
         )
-
-        first_timestamp = pd.to_datetime(timestamp_search["@timestamp"])[0]
-
-        offset_minutes = round(
-            (datetime.now(pytz.timezone("utc")) - first_timestamp).total_seconds() / 60
-        )
-
-    filters_list = filters + [
-        {
-            "range": {
-                "@timestamp": {
-                    "gte": f"now-{offset_minutes}m",
-                    "time_zone": "Australia/Adelaide",
-                }
-            }
-        }
-    ]
-        
-    # Add reporting_group filter only if a value is provided
-    if reporting_group:
-        filters_list.append({"term": {"reporting.reporting_group.keyword": reporting_group}})
-
-    return {
-        "bool": {
-            "filter": filters_list
-        }
-    }
+    else:
+        st.write("Something went wrong with authentication")
 
 
-def revenue_aggregations(offset_minutes: int = None, reporting_group: str = None) -> DataFrame:
-    query = relative_time_query_builder(
-        index="*-retail-product",
-        offset_minutes=offset_minutes,
-        reporting_group=reporting_group,
-        filters=[{"term": {"data.transaction.standard_sale": True}}],
+if st.query_params.get("login") == "true":
+    auth_code = st.query_params.get("code")
+    state = st.query_params.get("state")
+
+    if auth_code and state:
+        redirect_uri = f"www/?code={auth_code}&state={state}"
+        user = authorize(redirect_uri=redirect_uri, state=state)
+
+        if user.get("access_token") and user.get("refresh_token"):
+            st.session_state["access_token"] = user["access_token"]
+            st.session_state["refresh_token"] = user["refresh_token"]
+
+        st.query_params.clear()
+
+if not st.session_state.get("access_token"):
+    st.stop()
+
+
+adelaide_tz = pytz.timezone(TIME_ZONE)
+conn = st.connection(
+    "es", type=ElasticConnection, bearer_auth=st.session_state["access_token"]
+)
+
+
+def get_total_sales(filters):
+    res = conn.query(
+        query="""
+        SELECT
+            sum("data.transaction_value.total_ex") as "total_sales" 
+        FROM
+            "*-retail-transactions"
+        """,
+        filter=filters,
     )
+    return res
 
-    aggregations_df = conn.search_aggregation(
-        index="*-retail-product",
-        aggregations={
-            "total_ex_sum": {"sum": {"field": "data.total_ex"}},
-            "total_price_sum": {"sum": {"field": "data.total_price"}},
-        },
-        query=query,
+
+def get_budget(filters):
+    res = conn.query(
+        query='SELECT budget_total FROM "event-schedule" ORDER BY budget_total desc',
+        filter=filters,
     )
-
-    aggregations_df = aggregations_df.set_index("aggregation")
-
-    return aggregations_df
+    return res
 
 
-def revenue_chart(offset_minutes: int = None, reporting_group: str = None) -> DataFrame:
-    query = relative_time_query_builder(
-        index="*-retail-transactions",
-        offset_minutes=offset_minutes,
-        reporting_group=reporting_group,
-        filters=[
-            {
-                "bool": {
-                    "must_not": {
-                        "bool": {
-                            "should": [
-                                {"match": {"data.transaction_value.total_inc": "0"}}
-                            ],
-                            "minimum_should_match": 1,
-                        }
-                    }
-                }
-            }
-        ],
+def get_highest_hour(filters):
+    res = conn.query(
+        query="""
+        SELECT 
+            HISTOGRAM("@timestamp",INTERVAL 1 HOUR) as "datetime", 
+            sum("data.transaction_value.total_ex") as "sale_total",
+            count(DISTINCT "data.id") as "txn_total" 
+        FROM
+            "*-retail-transactions" 
+        WHERE 
+            "data.transaction_value.total_ex" != 0 
+        GROUP BY 
+            "datetime" 
+        ORDER BY 
+            sum("data.transaction_value.total_ex") desc 
+        LIMIT 1
+        """,
+        filter=filters,
     )
+    return res
 
-    return conn.search_aggregation(
-        index="*-retail-transactions",
-        aggregations={
-            "sum_per_5min": {
-                "date_histogram": {
-                    "field": "@timestamp",
-                    "fixed_interval": "5m",
-                    "time_zone": "Australia/Adelaide",
-                    "format": "HH:mm",
-                },
-                "aggs": {
-                    "total_ex_sum": {
-                        "sum": {"field": "data.transaction_value.total_ex"}
-                    }
-                },
-            },
-        },
-        query=query,
+
+def get_active_terminals(filters):
+    res = conn.query(
+        query="""
+        SELECT 
+            count(DISTINCT "data.transaction.terminal.id") as "swiftpos_terminals",
+            count(DISTINCT "data.transaction.kiosk_id") as "mashgin_terminals"
+        FROM
+            "*-retail-product"
+        WHERE
+            "@timestamp" > DATEADD('minutes', -15, NOW()) and "data.total_ex" != 0
+        """,
+        filter=filters,
     )
+    return res
 
 
-def top_locations(offset_minutes: int = None, reporting_group: str = None):
-    query = relative_time_query_builder(
-        index="*-retail-product",
-        offset_minutes=offset_minutes,
-        reporting_group=reporting_group
+def get_sales_by_location(filters):
+    res = conn.query(
+        query="""
+        SELECT
+            "data.location.name" as "Location",
+            count(DISTINCT CASE 
+                WHEN "@timestamp" > DATEADD('minutes', -15, NOW()) THEN "data.transaction.terminal.id"
+                ELSE null
+            END) as "Active",
+            sum(CASE 
+                WHEN "data.master_group.id" = '20' THEN "data.total_ex"
+                ELSE 0
+            END) as "Beverage",
+            sum(CASE 
+                WHEN "data.master_group.id" = '10' THEN "data.total_ex"
+                ELSE 0
+            END) as "Food",
+            sum("data.total_ex") as "Total"
+        FROM 
+            "*-retail-product"
+        WHERE 
+            "data.total_ex" != 0 and "data.master_group.id" = '10' or "data.master_group.id" = '20'
+        GROUP BY
+            "data.location.id", "data.location.name"
+        ORDER BY
+            sum("data.total_ex") desc
+        LIMIT 15
+        """,
+        filter=filters,
     )
+    return res
 
-    return pd.json_normalize(
-        conn.searchv2(
-            index="*-retail-product",
-            query={
-                "bool": {
-                    "must": query,  # Keep existing query conditions
-                    "filter": [
-                        {
-                            "bool": {
-                                "should": [
-                                    {"range": {"data.total_ex": {"lt": 0}}},  # Include negatives
-                                    {"range": {"data.total_ex": {"gt": 0}}},  # Include positives
-                                ],
-                                "minimum_should_match": 1,  # At least one condition must match
-                            }
-                        }
-                    ]
-                }
-            },
-            size=0,
-            aggs={
-                "categories": {
-                    "composite": {
-                        "size": 20,
-                        "sources": [
-                            {"category": {"terms": {"field": "data.location.id"}}},
-                            {
-                                "sub_category": {
-                                    "terms": {"field": "data.location.name.keyword"}
-                                }
-                            },
-                        ],
-                    },
-                    "aggs": {
-                        "total": {"sum": {"field": "data.total_ex"}},
-                        "sorted_categories": {
-                            "bucket_sort": {
-                                "sort": [{"total": {"order": "desc"}}],
-                                "size": 20
-                            }
-                        }
-                    },
-                }
-            },
-        )["aggregations"]["categories"]["buckets"]
+
+def get_sales_by_timestamp():
+    return
+
+
+def get_sales_by_product(filters):
+    res = conn.query(
+        query="""
+        SELECT
+            "data.name.keyword" as "Item",
+            sum("data.quantity") as "Qty Sold",
+            sum("data.total_ex") as "Total"
+        FROM
+            "swiftpos-retail-product"
+        WHERE 
+            "data.master_group.id" = '10' or "data.master_group.id" = '20'
+        GROUP BY 
+            "data.name.keyword"
+        ORDER BY 
+            sum("data.total_ex") desc
+        """,
+        filter=filters,
     )
+    return res
 
 
-# -----------------------------------------------------------------------------
+def get_visitation(filters):
+    res = conn.query(
+        query="""
+        SELECT 
+            count("data.barcode") as entries
+        FROM
+            "ticketek-customer-attendance"
+        WHERE
+            "data.status.type" = 'Entry' and "data.priceTypeName" != 'TICKETEK TEST'
+        """,
+        filter=filters,
+    )
+    return res
+
+
 # Draw the actual page
-
 # Set the title that appears at the top of the page.
-
-
 """
 # Retail Analytics
 
 """
-# top-level filters
-time_filer = st.pills(
-    "Show data from", options=time_filters, format_func=lambda x: x["name"]
-)
-reporting_group=st.pills("Filter data", options=["event_retail", "mtx_club_hotel"])
+
+if st.button("Log out"):
+    logout_response = logout(
+        token=st.session_state.get("access_token"),
+        refresh_token=st.session_state.get("refresh_token"),
+    )
+
+    if logout_response.get("redirect"):
+        st.markdown(
+            f'<meta http-equiv="refresh" content="0;url={LOGOUT_URL}">',
+            unsafe_allow_html=True,
+        )
+
+
+date_filter = st.date_input("Pick a date", max_value="today", format="DD/MM/YYYY")
+
+reporting_group = st.pills("Filter data", options=["event_retail", "mtx_club_hotel"])
 refresh_toggle = st.toggle(value=False, label="Auto Refresh")
 refresh_seconds = st.number_input(value=5, label="Refresh seconds")
 
+filters = configure_filters(reporting_group=reporting_group, date=date_filter)
+
 # creating a single-element container
 placeholder = st.empty()
-
-minute_offset = None
-if time_filer:
-    minute_offset = time_filer["minute_offset"]
-
 
 refresh = True
 while refresh:
@@ -316,34 +335,21 @@ while refresh:
 
         f"Last refresh: {datetime.now(adelaide_tz).strftime('%A, %d %B %Y %I:%M:%S %p')}"
 
-        revenue_totals = revenue_aggregations(minute_offset, reporting_group=reporting_group)
+        total_sales = get_total_sales(filters=filters)
+        budget = get_budget(configure_filters(date_filter))
+        highest_hour = get_highest_hour(filters=filters)
+        active_terminals = get_active_terminals(filters=filters)
+        sales_by_Location = get_sales_by_location(filters=filters)
+        sales_by_product = get_sales_by_product(filters)
+        visitation = get_visitation(configure_filters(date_filter))
 
-        st.metric(
-            label="Sales (Ex GST)",
-            value=f"${revenue_totals.loc['total_ex_sum']['value']:,.2f}",
-        )
-
-        transactions_timeseries_df = revenue_chart(minute_offset, reporting_group=reporting_group)
-
-        if not transactions_timeseries_df.empty:
-            transactions_timeseries_df["value"] = round(
-                transactions_timeseries_df["value"], 2
-            )
-            st.bar_chart(transactions_timeseries_df, x="bucket", y="value")
-
-        top_locations_data = top_locations(offset_minutes=minute_offset, reporting_group=reporting_group)
-        if "total.value" in top_locations_data: 
-            top_locations_data.sort_values(by="total.value", ascending=False, inplace=True)
-            top_locations_data.drop(columns=["doc_count", "key.category"], inplace=True)
-            top_locations_data["total.value"] = top_locations_data["total.value"].apply(
-                lambda x: f"${x:,.2f}"
-            )
-            top_locations_data.rename(
-                columns={"key.sub_category": "Location", "total.value": "Total Sales"},
-                inplace=True,
-            )
-
-        st.table(top_locations_data)
+        st.write(total_sales)
+        st.write(budget)
+        st.write(highest_hour)
+        st.write(active_terminals)
+        st.write(sales_by_Location)
+        st.write(sales_by_product)
+        st.write(visitation)
 
     refresh = refresh_toggle
 
