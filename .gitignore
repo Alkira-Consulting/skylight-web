@@ -1,4 +1,10 @@
 .streamlit/secrets.toml
+.streamlit/secrets-copy.toml
+.devcontainer
+.github
+devcontainer/
+github/
+
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
