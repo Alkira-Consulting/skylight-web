@@ -1,12 +1,6 @@
 [browser]
 gatherUsageStats = false
-serverAddress = "localhost"
-serverPort = 8501
 
 [client]
 showErrorDetails = "none"
 toolbarMode = "minimal"
-
-[server]
-fileWatcherType = "none"
-headless = true
