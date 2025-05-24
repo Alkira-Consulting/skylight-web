@@ -1,13 +1,14 @@
 import pytz
-import time
 import requests
 import pandas as pd
 import streamlit as st
 from elasticsearch import Elasticsearch
+from zoneinfo import ZoneInfo
 from datetime import datetime
+from streamlit_autorefresh import st_autorefresh
+from streamlit_extras.stylable_container import stylable_container
 from elasticsearch.exceptions import AuthenticationException
 from streamlit.connections import ExperimentalBaseConnection
-
 
 # === Constants ===
 ELASTIC_CLOUD_ID = st.secrets["ELASTICSEARCH_CLOUD_ID"]
@@ -126,7 +127,7 @@ def configure_filters(date=None, reporting_group=None):
 
 # Set the title and favicon that appear in the Browser's tab bar.
 st.set_page_config(
-    page_title="Retail Analytics | Skylight",
+    page_title="AO Retail Analytics | Alkira Skylight",
 )
 
 if not st.session_state.get("access_token") and not st.query_params.get("login"):
@@ -165,7 +166,7 @@ conn = st.connection(
 )
 
 
-def get_total_sales(filters):
+def total_sales_metric(filters):
     res = conn.query(
         query="""
         SELECT
@@ -175,18 +176,22 @@ def get_total_sales(filters):
         """,
         filter=filters,
     )
-    return res
 
+    try:
+        total_sales = res.loc[0, "total_sales"]
+        total_sales = f"${round(total_sales):,}"
 
-def get_budget(filters):
-    res = conn.query(
-        query='SELECT budget_total FROM "event-schedule" ORDER BY budget_total desc',
-        filter=filters,
+    except:
+        total_sales = "-"
+
+    return st.metric(
+        label="Total Sales (ex GST)",
+        value=total_sales,
+        border=True,
     )
-    return res
 
 
-def get_highest_hour(filters):
+def highest_hour_metric(filters):
     res = conn.query(
         query="""
         SELECT 
@@ -205,10 +210,19 @@ def get_highest_hour(filters):
         """,
         filter=filters,
     )
-    return res
+
+    try:
+        hour = res.loc[0, "datetime"]
+        hour_utc = datetime.fromisoformat(hour.replace("Z", "+00:00"))
+        adelaide_time = hour_utc.astimezone(ZoneInfo("Australia/Adelaide"))
+        highest_hour = adelaide_time.strftime("%-I %p")
+    except:
+        highest_hour = "-"
+
+    return st.metric(label="Highest Hour", value=highest_hour, border=True)
 
 
-def get_active_terminals(filters):
+def active_terminals_metric(filters):
     res = conn.query(
         query="""
         SELECT 
@@ -221,11 +235,19 @@ def get_active_terminals(filters):
         """,
         filter=filters,
     )
-    return res
+
+    try:
+        active_terminals = (
+            res.loc[0, "swiftpos_terminals"] + res.loc[0, "mashgin_terminals"]
+        )
+    except:
+        active_terminals = "-"
+
+    return st.metric(label="Active Terminals", value=active_terminals, border=True)
 
 
-def get_sales_by_location(filters):
-    res = conn.query(
+def sales_by_location_dataframe(filters):
+    sales_by_Location = conn.query(
         query="""
         SELECT
             "data.location.name" as "Location",
@@ -254,15 +276,62 @@ def get_sales_by_location(filters):
         """,
         filter=filters,
     )
-    return res
+
+    return st.dataframe(
+        sales_by_Location,
+        hide_index=True,
+        column_config={
+            "Location": st.column_config.TextColumn(),
+            "Active": st.column_config.NumberColumn(),
+            "Beverage": st.column_config.NumberColumn(format="dollar"),
+            "Food": st.column_config.NumberColumn(format="dollar"),
+            "Total": st.column_config.NumberColumn(format="dollar"),
+        },
+    )
 
 
-def get_sales_by_timestamp():
-    return
+def sales_bar_chart(filters):
+    sales_by_timestamp = conn.query(
+        query="""
+    SELECT 
+        HISTOGRAM("@timestamp",INTERVAL 1 MINUTE) as "datetime", 
+        sum("data.transaction_value.total_ex") as "sale_total"
+    FROM
+        "*-retail-transactions" 
+    WHERE 
+        "data.transaction_value.total_ex" != 0 
+    GROUP BY 
+        "datetime" 
+    ORDER BY 
+        sum("data.transaction_value.total_ex") desc 
+    """,
+        filter=filters,
+    )
+
+    try:
+        sales_by_timestamp["datetime"] = pd.to_datetime(
+            sales_by_timestamp["datetime"], utc=True
+        )
+        sales_by_timestamp["datetime"] = sales_by_timestamp["datetime"].dt.tz_convert(
+            "Australia/Adelaide"
+        )
+    except:
+        pass
+
+    if sales_by_timestamp.empty:
+        return
+
+    return st.bar_chart(
+        sales_by_timestamp,
+        x="datetime",
+        y="sale_total",
+        x_label="Time",
+        y_label="Sales (ex GST)",
+    )
 
 
-def get_sales_by_product(filters):
-    res = conn.query(
+def sales_by_product_dataframe(filters):
+    sales_by_product = conn.query(
         query="""
         SELECT
             "data.name.keyword" as "Item",
@@ -276,13 +345,23 @@ def get_sales_by_product(filters):
             "data.name.keyword"
         ORDER BY 
             sum("data.total_ex") desc
+        LIMIT 20
         """,
         filter=filters,
     )
-    return res
+
+    return st.dataframe(
+        sales_by_product,
+        hide_index=True,
+        column_config={
+            "Item": st.column_config.TextColumn(),
+            "Qty Sold": st.column_config.NumberColumn(),
+            "Total": st.column_config.NumberColumn(format="dollar"),
+        },
+    )
 
 
-def get_visitation(filters):
+def visitation_metric(filters):
     res = conn.query(
         query="""
         SELECT 
@@ -294,64 +373,88 @@ def get_visitation(filters):
         """,
         filter=filters,
     )
-    return res
+
+    try:
+        visitation = res.loc[0, "entries"]
+        visitation = f"{visitation:,}"
+    except:
+        visitation = "-"
+
+    return st.metric(label="Visitors", value=visitation, border=True)
 
 
 # Draw the actual page
 # Set the title that appears at the top of the page.
-"""
-# Retail Analytics
+with stylable_container(
+    key="logout",
+    css_styles="""
+    button{
+        float: right;
+    }
+    """,
+):
+    with st.popover("", icon=":material/settings:"):
+        refresh = st.toggle(value=True, label="Auto Refresh")
+        refresh_seconds = st.number_input(value=10, label="Refresh seconds")
+        if st.button("Logout", icon=":material/logout:", type="tertiary"):
+            logout_response = logout(
+                token=st.session_state.get("access_token"),
+                refresh_token=st.session_state.get("refresh_token"),
+            )
 
-"""
-
-if st.button("Log out"):
-    logout_response = logout(
-        token=st.session_state.get("access_token"),
-        refresh_token=st.session_state.get("refresh_token"),
-    )
-
-    if logout_response.get("redirect"):
-        st.markdown(
-            f'<meta http-equiv="refresh" content="0;url={LOGOUT_URL}">',
-            unsafe_allow_html=True,
-        )
-
+st.title("Skylight")
 
 date_filter = st.date_input("Pick a date", max_value="today", format="DD/MM/YYYY")
 
-reporting_group = st.pills("Filter data", options=["event_retail", "mtx_club_hotel"])
-refresh_toggle = st.toggle(value=False, label="Auto Refresh")
-refresh_seconds = st.number_input(value=5, label="Refresh seconds")
+reporting_group = st.pills(
+    "Filter data", options=["event_retail", "mtx_club_hotel"], default="event_retail"
+)
+
+if refresh:
+    st_autorefresh(interval=refresh_seconds * 1000, key="auto_refresh")
 
 filters = configure_filters(reporting_group=reporting_group, date=date_filter)
 
-# creating a single-element container
-placeholder = st.empty()
+col1, col2 = st.columns(2)
 
-refresh = True
-while refresh:
+with col1:
+    total_sales_metric(filters=filters)
+    highest_hour_metric(filters=filters)
 
-    with placeholder.container():
+with col2:
+    visitation_metric(filters=configure_filters(date_filter))
+    active_terminals_metric(filters=filters)
 
-        f"Last refresh: {datetime.now(adelaide_tz).strftime('%A, %d %B %Y %I:%M:%S %p')}"
+sales_bar_chart(filters=filters)
 
-        total_sales = get_total_sales(filters=filters)
-        budget = get_budget(configure_filters(date_filter))
-        highest_hour = get_highest_hour(filters=filters)
-        active_terminals = get_active_terminals(filters=filters)
-        sales_by_Location = get_sales_by_location(filters=filters)
-        sales_by_product = get_sales_by_product(filters)
-        visitation = get_visitation(configure_filters(date_filter))
+st.subheader("Top Locations")
+sales_by_location_dataframe(filters=filters)
 
-        st.write(total_sales)
-        st.write(budget)
-        st.write(highest_hour)
-        st.write(active_terminals)
-        st.write(sales_by_Location)
-        st.write(sales_by_product)
-        st.write(visitation)
+st.subheader("Top Products")
+sales_by_product_dataframe(filters=filters)
 
-    refresh = refresh_toggle
 
-    if refresh:
-        time.sleep(refresh_seconds)
+st.caption(
+    f"Last refresh: {datetime.now(adelaide_tz).strftime('%A, %d %B %Y %I:%M:%S %p')}"
+)
+
+st.badge("Powered by Alkira Skylight", color="blue")
+
+
+st.markdown(
+    """
+    <style>
+        div[data-testid="column"]:nth-of-type(1)
+        {
+            border:1px solid red;
+        } 
+
+        div[data-testid="column"]:nth-of-type(2)
+        {
+            border:1px solid blue;
+            text-align: end;
+        } 
+    </style>
+    """,
+    unsafe_allow_html=True,
+)

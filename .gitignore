@@ -1,5 +1,6 @@
 .streamlit/secrets.toml
 .streamlit/secrets-copy.toml
+.streamlit/config.toml
 .devcontainer
 .github
 devcontainer/
