@@ -452,15 +452,12 @@ with stylable_container(
         refresh = st.toggle(value=True, label="Auto Refresh")
         refresh_seconds = st.number_input(value=10, label="Refresh seconds")
         if st.button("Logout", icon=":material/logout:", type="tertiary"):
-            logout_response = logout(
-                token=st.session_state.get("access_token"),
-                refresh_token=st.session_state.get("refresh_token"),
-            )
             logout_user()
+
 
 st.title("Skylight")
 
-date_filter = st.date_input("Pick a date", max_value="today", format="DD/MM/YYYY")
+date_filter = st.date_input("Pick a date", max_value=datetime.now(adelaide_tz), format="DD/MM/YYYY")
 
 reporting_group = st.pills(
     "Filter data", options=["event_retail", "mtx_club_hotel"], default="event_retail"
