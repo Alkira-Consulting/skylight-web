@@ -54,9 +54,8 @@ class ElasticConnection(ExperimentalBaseConnection[Elasticsearch]):
 
             # Convert to DataFrame
             return pd.DataFrame(rows, columns=columns)
-
         except AuthenticationException as e:
-            print("Authentication failed:", e)
+            pass
         except Exception as e:
             print("Search error:", e)
         return None
