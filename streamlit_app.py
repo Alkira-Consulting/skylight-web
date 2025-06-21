@@ -335,17 +335,17 @@ def sales_by_location_dataframe(filters):
         filter=filters,
     )
 
-    return st.dataframe(
-        sales_by_Location,
-        hide_index=True,
-        column_config={
-            "Location": st.column_config.TextColumn(),
-            "Active": st.column_config.NumberColumn(),
-            "Beverage": st.column_config.NumberColumn(format="dollar"),
-            "Food": st.column_config.NumberColumn(format="dollar"),
-            "Total": st.column_config.NumberColumn(format="dollar"),
-        },
-    )
+    if sales_by_Location is not None and not sales_by_Location.empty:
+
+        sales_by_Location = sales_by_Location.style.format(
+            {
+                "Beverage": lambda x: f"${x:,.0f}",
+                "Food": lambda x: f"${x:,.0f}",
+                "Total": lambda x: f"${x:,.0f}",
+            }
+        )
+
+        return st.dataframe(sales_by_Location, hide_index=True)
 
 
 def sales_bar_chart(filters):
@@ -374,7 +374,7 @@ def sales_bar_chart(filters):
             "Australia/Adelaide"
         )
     except:
-        pass
+        return
 
     if sales_by_timestamp.empty:
         return
@@ -408,15 +408,13 @@ def sales_by_product_dataframe(filters):
         filter=filters,
     )
 
-    return st.dataframe(
-        sales_by_product,
-        hide_index=True,
-        column_config={
-            "Item": st.column_config.TextColumn(),
-            "Qty Sold": st.column_config.NumberColumn(),
-            "Total": st.column_config.NumberColumn(format="dollar"),
-        },
-    )
+    if sales_by_product is not None and not sales_by_product.empty:
+
+        sales_by_product = sales_by_product.style.format(
+            {"Qty Sold": "{:,.0f}", "Total": lambda x: f"${x:,.0f}"}
+        )
+
+        return st.dataframe(sales_by_product, hide_index=True)
 
 
 def visitation_metric(filters):
