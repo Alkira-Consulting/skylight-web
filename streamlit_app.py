@@ -22,12 +22,15 @@ TIME_ZONE = st.secrets["TIME_ZONE"]
 
 # === Elasticsearch Connection Wrapper ===
 class ElasticConnection(ExperimentalBaseConnection[Elasticsearch]):
-    def _connect(self, **kwargs) -> Elasticsearch:
-        bearer_auth = kwargs.pop("bearer_auth", "")
+    def __init__(self, connection_name: str, access_token: str, **kwargs):
+        self.access_token = access_token
+        super().__init__(connection_name, **kwargs)
+
+    def _connect(self) -> Elasticsearch:
         return Elasticsearch(
             cloud_id=st.secrets["ELASTICSEARCH_CLOUD_ID"],
             headers={
-                "Authorization": f"Bearer {bearer_auth}",
+                "Authorization": f"Bearer {self.access_token}",
                 "Content-Type": "application/vnd.elasticsearch+json;compatible-with=8",
                 "Accept": "application/vnd.elasticsearch+json;compatible-with=8",
             },
@@ -58,10 +61,16 @@ class ElasticConnection(ExperimentalBaseConnection[Elasticsearch]):
             print("Search error:", e)
         return None
 
+    def get_info(self):
+        try:
+            return self.client.info()
+        except:
+            return None
+
 
 # === OIDC Auth ===
 def login():
-    url = f"{ELASTIC_AUTH_BASE_URL}/prepare"
+    url = f"{ELASTIC_AUTH_BASE_URL}/_security/oidc/prepare"
     payload = {"realm": ELASTIC_AUTH_REALM, "nonce": AUTH_NONCE}
     headers = {
         "Content-Type": "application/json",
@@ -73,7 +82,7 @@ def login():
 
 
 def logout(token: str, refresh_token: str):
-    url = f"{ELASTIC_AUTH_BASE_URL}/logout"
+    url = f"{ELASTIC_AUTH_BASE_URL}/_security/oidc/logout"
     payload = {"token": token, "refresh_token": refresh_token}
     headers = {
         "Content-Type": "application/json",
@@ -85,13 +94,25 @@ def logout(token: str, refresh_token: str):
 
 
 def authorize(redirect_uri: str, state: str):
-    url = f"{ELASTIC_AUTH_BASE_URL}/authenticate"
+    url = f"{ELASTIC_AUTH_BASE_URL}/_security/oidc/authenticate"
     payload = {
         "redirect_uri": redirect_uri,
         "state": state,
         "nonce": AUTH_NONCE,
         "realm": ELASTIC_AUTH_REALM,
     }
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": ELASTIC_API_KEY,
+    }
+
+    response = requests.post(url, headers=headers, json=payload)
+    return response.json()
+
+
+def refresh(refresh_token: str):
+    url = f"{ELASTIC_AUTH_BASE_URL}/_security/oauth2/token"
+    payload = {"grant_type": "refresh_token", "refresh_token": refresh_token}
     headers = {
         "Content-Type": "application/json",
         "Authorization": ELASTIC_API_KEY,
@@ -130,7 +151,27 @@ st.set_page_config(
     page_title="AO Retail Analytics | Alkira Skylight",
 )
 
-if not st.session_state.get("access_token") and not st.query_params.get("login"):
+
+def logout_user():
+    logout(
+        token=st.session_state.get("access_token"),
+        refresh_token=st.session_state.get("refresh_token"),
+    )
+
+    del st.session_state["access_token"]
+    del st.session_state["refresh_token"]
+
+    return st.markdown(
+        f'<meta http-equiv="refresh" content="0;url={LOGOUT_URL}">',
+        unsafe_allow_html=True,
+    )
+
+
+if (
+    not st.session_state.get("access_token")
+    and not st.session_state.get("refresh_token")
+    and not st.query_params.get("login")
+):
     login_response = login()
 
     if login_response.get("redirect") and login_response.get("nonce"):
@@ -156,14 +197,31 @@ if st.query_params.get("login") == "true":
 
         st.query_params.clear()
 
-if not st.session_state.get("access_token"):
+if not st.session_state.get("access_token") and not st.session_state.get(
+    "refresh_token"
+):
     st.stop()
 
 
 adelaide_tz = pytz.timezone(TIME_ZONE)
 conn = st.connection(
-    "es", type=ElasticConnection, bearer_auth=st.session_state["access_token"]
+    "es", type=ElasticConnection, access_token=st.session_state["access_token"]
 )
+
+if conn.get_info() is None:
+    try:
+        refresh_res = refresh(st.session_state.get("refresh_token"))
+
+        if refresh_res.get("error"):
+            logout_user()
+
+        st.session_state["access_token"] = refresh_res.get("access_token")
+        st.session_state["refresh_token"] = refresh_res.get("refresh_token")
+        conn = st.connection(
+            "es", type=ElasticConnection, access_token=st.session_state["access_token"]
+        )
+    except:
+        logout_user()
 
 
 def total_sales_metric(filters):
@@ -401,6 +459,7 @@ with stylable_container(
                 token=st.session_state.get("access_token"),
                 refresh_token=st.session_state.get("refresh_token"),
             )
+            logout_user()
 
 st.title("Skylight")
 
